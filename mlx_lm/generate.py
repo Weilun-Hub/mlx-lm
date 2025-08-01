@@ -355,18 +355,18 @@ def generate_step(
     if prompt_cache is None:
         prompt_cache = cache.make_prompt_cache(
             model,
-            max_kv_size=max_kv_size,
-        )
+            max_kv_size=max_kv_size, # None
+        ) # [KVCache() * 32]
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=kv_bits,
+        quantized_kv_start=quantized_kv_start, # 0
+        kv_group_size=kv_group_size, # 64
+        kv_bits=kv_bits, # None
     )
-
+    # sampler = None
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
@@ -408,9 +408,9 @@ def generate_step(
     with mx.stream(generation_stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
-        )
+        ) # 6, number of tokens in prompt
         prompt_processed_tokens = 0
-        while total_prompt_tokens - prompt_processed_tokens > prefill_step_size:
+        while total_prompt_tokens - prompt_processed_tokens > prefill_step_size: # prefill_step_size = 2048. (6 - 0 > 2048) -> False
             _model_call(
                 input_tokens=prompt[:prefill_step_size][None],
                 input_embeddings=(
@@ -431,7 +431,7 @@ def generate_step(
             )
             mx.clear_cache()
 
-        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings) # array([1, 32381, 1664, 1872, 1449, 1502], dtype=int32), None
 
     mx.async_eval(y, logprobs)
     n = 0
@@ -661,7 +661,7 @@ def stream_generate(
                 tokenizer.bos_token
             )
             prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-        prompt = mx.array(prompt)
+        prompt = mx.array(prompt) # [1, 32381, 1664, 1872, 1449, 1502]
 
     detokenizer = tokenizer.detokenizer
 
