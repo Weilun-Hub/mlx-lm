@@ -45,18 +45,18 @@ def create_causal_mask(
 def create_attention_mask(
     h: mx.array, cache: Optional[Any] = None, return_array: bool = False
 ):
-    T = h.shape[1]
+    T = h.shape[1] # (1, 6, 4096) -> 6
     if T > 1:
         offset = 0
         window_size = None
-        if cache is not None and cache[0] is not None:
-            c = cache[0]
-            offset = c.offset
-            if hasattr(c, "max_size"):
+        if cache is not None and cache[0] is not None: # here
+            c = cache[0] # mlx_lm.models.cache.KVCache
+            offset = c.offset # 0
+            if hasattr(c, "max_size"): # false
                 window_size = c.max_size
                 offset = min(window_size, offset)
                 return_array = return_array or offset + T > window_size
-        if return_array:
+        if return_array: # false
             return create_causal_mask(T, offset, window_size=window_size)
         else:
             return "causal"

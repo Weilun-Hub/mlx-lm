@@ -383,7 +383,7 @@ def generate_step(
         with mx.stream(generation_stream):
             logits = _model_call(
                 input_tokens=input_tokens[None],
-                input_embeddings=(
+                input_embeddings=( # input_embeddings is None
                     input_embeddings[None] if input_embeddings is not None else None
                 ),
             )

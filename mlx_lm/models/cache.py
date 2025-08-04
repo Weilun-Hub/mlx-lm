@@ -255,26 +255,26 @@ class KVCache(_BaseCache):
     def update_and_fetch(self, keys, values):
         prev = self.offset
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = keys.shape
-            v_head_dim = values.shape[3]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
-            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
-            new_k = mx.zeros(k_shape, keys.dtype)
-            new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
+            B, n_kv_heads, _, k_head_dim = keys.shape # [1], [2], 6, [128]
+            v_head_dim = values.shape[3] # 1, 2, 6, [128]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step # 256 as a step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 256, 128
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim) # 1, 2, 256, 128
+            new_k = mx.zeros(k_shape, keys.dtype) # 1, 2, 256, 128
+            new_v = mx.zeros(v_shape, values.dtype) # 1, 2, 256, 128
+            if self.keys is not None: # skip
                 if prev % self.step != 0:
                     self.keys = self.keys[..., :prev, :]
                     self.values = self.values[..., :prev, :]
                 self.keys = mx.concatenate([self.keys, new_k], axis=2)
                 self.values = mx.concatenate([self.values, new_v], axis=2)
-            else:
+            else: # here
                 self.keys, self.values = new_k, new_v
 
-        self.offset += keys.shape[2]
-        self.keys[..., prev : self.offset, :] = keys
-        self.values[..., prev : self.offset, :] = values
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        self.offset += keys.shape[2] # 1, 2, [6], 128
+        self.keys[..., prev : self.offset, :] = keys # 1, 2, 0 : 6, 128
+        self.values[..., prev : self.offset, :] = values # 1, 2, 0 : 6, 128
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :] # first self.offset tokens
 
     @property
     def state(self):
