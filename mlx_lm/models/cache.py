@@ -257,16 +257,16 @@ class KVCache(_BaseCache):
         if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape # [1], [2], 6, [128]
             v_head_dim = values.shape[3] # 1, 2, 6, [128]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step # 256 as a step
+            n_steps = (self.step + keys.shape[2] - 1) // self.step # 256 as a step, CEIL_DIV
             k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 256, 128
             v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim) # 1, 2, 256, 128
             new_k = mx.zeros(k_shape, keys.dtype) # 1, 2, 256, 128
             new_v = mx.zeros(v_shape, values.dtype) # 1, 2, 256, 128
             if self.keys is not None: # skip
-                if prev % self.step != 0:
+                if prev % self.step != 0: # skip
                     self.keys = self.keys[..., :prev, :]
                     self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.keys = mx.concatenate([self.keys, new_k], axis=2) # 1, 2, [2048 + 2048] = 4096, 128
                 self.values = mx.concatenate([self.values, new_v], axis=2)
             else: # here
                 self.keys, self.values = new_k, new_v

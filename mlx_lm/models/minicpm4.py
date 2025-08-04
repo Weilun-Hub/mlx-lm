@@ -9,6 +9,7 @@ import mlx.nn as nn
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 
+import numpy as np
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -55,37 +56,37 @@ def calc_chunks_with_stride(cu_seqlen, chunk_size, kernel_stride):
         cu_seqlens_compressed (torch.Tensor): Cumulative sequence lengths after compression.
     """
     # 1. Compute the length of each sequence
-    batch_sizes = cu_seqlen[1:] - cu_seqlen[:-1] # [14001]
+    batch_sizes = cu_seqlen[1:] - cu_seqlen[:-1] # [8192]
 
     # 2. Compute the start positions of chunks for each sequence (with stride)
-    max_seq_len = mx.max(batch_sizes) # 14001
-    max_num_chunks_per_seq = (max_seq_len - chunk_size) // kernel_stride + 1 # (14001 - 32) // 16 + 1 = 874
-    chunk_start_offsets = mx.arange(0, max_num_chunks_per_seq * kernel_stride, kernel_stride, device=cu_seqlen.device) # [0, 16, 32, ..., 13952, 13968], shape = 874
+    max_seq_len = mx.max(batch_sizes).item() # 8192
+    max_num_chunks_per_seq = (max_seq_len - chunk_size) // kernel_stride + 1 # (8192 - 32) // 16 + 1 = 511
+    chunk_start_offsets = mx.arange(0, max_num_chunks_per_seq * kernel_stride, kernel_stride) # [0, 16, 32, ..., 8144, 8160], shape = 511
     seq_starts = cu_seqlen[:-1] # [0]
-    chunk_start_in_seq = seq_starts[:, None] + chunk_start_offsets[None, :]  # [batch_size, max_num_chunks_per_seq], shape = (1, 874)
+    chunk_start_in_seq = seq_starts[:, None] + chunk_start_offsets[None, :]  # [batch_size, max_num_chunks_per_seq], shape = (1, 511)
 
     # 3. Filter out chunks that exceed sequence length or are smaller than the full chunk size
-    chunk_end_in_seq = chunk_start_in_seq + chunk_size # [0 + 32, 16 + 32, 32 + 32, ..., 13952 + 32, 13968 + 32] = [32, 48, 64, ..., 14000, 14016], shape = (1, 874)
-    valid_chunk_mask = (chunk_end_in_seq <= (seq_starts[:, None] + batch_sizes[:, None])) # shape = (1, 874), [True, True, True, ..., True, True]
+    chunk_end_in_seq = chunk_start_in_seq + chunk_size # [0 + 32, 16 + 32, 32 + 32, ..., 8144 + 32, 8160 + 32] = [32, 48, 64, ..., 8176, 8192], shape = (1, 511)
+    valid_chunk_mask = (chunk_end_in_seq <= (seq_starts[:, None] + batch_sizes[:, None])) # shape = (1, 511), [True, True, True, ..., True, True]
 
     # 4. Filter valid chunk start positions using the valid_chunk_mask
-    valid_chunk_starts = chunk_start_in_seq[valid_chunk_mask]  # [num_valid_chunks], shape = 874, [0, 16, 32, ..., 13952, 13968]
-    del chunk_start_in_seq
+    valid_chunk_mask_npy = np.array(valid_chunk_mask)
+    chunk_start_in_seq_npy = np.array(chunk_start_in_seq)
+    valid_chunk_starts_npy = chunk_start_in_seq_npy[valid_chunk_mask_npy]  # [num_valid_chunks], shape = 874, [0, 16, 32, ..., 8144, 8160]
+    valid_chunk_starts = mx.array(valid_chunk_starts_npy)
+    del chunk_start_in_seq, chunk_start_in_seq_npy
     # 5. Generate filtered_indices
-    chunk_indices = mx.arange(
-        0, chunk_size, device=cu_seqlen.device
-    )[None, :]  # [1, chunk_size], [0, 1, 2, ..., 31]
-    filtered_indices = valid_chunk_starts[:, None] + chunk_indices  # [num_valid_chunks, chunk_size], shape = (874, 32)
-    filtered_indices = filtered_indices.view(-1)  # Flatten to 1D indices [0, 1, 2, ..., 30, 31, | 16, 17, 46, 47, | 32, 33, ..., 62, 63, ... ]
+    chunk_indices = mx.arange(0, chunk_size)[None, :]  # [1, chunk_size], [0, 1, 2, ..., 31]
+    filtered_indices = valid_chunk_starts[:, None] + chunk_indices  # [num_valid_chunks, chunk_size], shape = (511, 32)
+    filtered_indices = filtered_indices.reshape(-1)  # Flatten to 1D indices [0, 1, 2, ..., 30, 31, | 16, 17, 46, 47, | 32, 33, ..., 62, 63, ... ]
 
     # 6. Compute compressed cumulative sequence lengths
-    num_filtered_chunks_per_batch = valid_chunk_mask.sum(dim=1)  # Number of valid chunks per batch, [874]
-    cu_seqlens_compressed = mx.zeros(
-        len(cu_seqlen), dtype=mx.int32, device=cu_seqlen.device
-    ) # [0, 0]
-    cu_seqlens_compressed[1:] = num_filtered_chunks_per_batch.cumsum(dim=0) # [0, 874]
-    del num_filtered_chunks_per_batch, chunk_start_offsets, seq_starts, chunk_end_in_seq, valid_chunk_mask, chunk_indices
-    return filtered_indices, cu_seqlens_compressed # (874 * 32), [0, 874]
+    num_filtered_chunks_per_batch = mx.sum(valid_chunk_mask, axis=1) # [511]
+    cu_seqlens_compressed = mx.zeros(len(cu_seqlen), dtype=mx.int32) # [0, 0]
+    # cu_seqlens_compressed[1:] = num_filtered_chunks_per_batch.cumsum(dim=0) # [0, 874]
+    cu_seqlens_compressed[1:] = mx.cumsum(num_filtered_chunks_per_batch, axis=0) # [0, 511]
+    del num_filtered_chunks_per_batch, chunk_start_offsets, seq_starts, chunk_end_in_seq, valid_chunk_mask, valid_chunk_mask_npy, chunk_indices
+    return filtered_indices, cu_seqlens_compressed # (511 * 32), [0, 511]
 
 
 class CompressK(nn.Module):
@@ -112,8 +113,9 @@ class CompressK(nn.Module):
     ) -> Tuple[mx.array, mx.array]:
         filtered_k_indices, cu_seqlens_compressed = calc_chunks_with_stride(
             cu_seqlens, self.kernel_size, self.kernel_stride
-        )
-        filtered_k = k.index_select(0, filtered_k_indices.view(-1))
+        ) # (511 * 32), [0, 511]
+        exit(0)
+        filtered_k = mx.gather(k, filtered_k_indices, axis=2)
         filtered_k = filtered_k.view(filtered_k.shape[0] // self.kernel_size, self.kernel_size, self.head_num_k, self.head_dim)  # [l, block_size,h,d]
         compressed_k = filtered_k.mean(dim=1)
         return compressed_k, cu_seqlens_compressed
@@ -174,7 +176,9 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ):
-        B, L, _ = x.shape # 1, 6, 4096. B = 1, L = 4096
+        B, L, _ = x.shape # 1, 6, 4096. B = 1, L = 2048 for chunked prefill
+
+        assert B == 1, "Batch size must be 1 for current implementation, but got {}".format(B)
 
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x) # queries: 1, 6, 4096 -> 1, 6, 4096. keys/values: 1, 6, 4096 -> 1, 6, 256.
 
@@ -195,15 +199,47 @@ class Attention(nn.Module):
         if cache.offset < self.dense_len:
             attn_output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
-            )
+            ) # queries: (1, 32, 2048, 128), keys: (1, 2, 4096, 128), values: (1, 2, 4096, 128)
         elif cache.keys is None or L != 1: # prefill
-            pass
+            # queries: (1, 32, 2048, 128), keys/values: (1, 2, 8192, 128)
+            attn_output = self._flash_attention_forward(queries, keys, values, cache, self.scale, mask)
         else:
             pass
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(attn_output)
+
+    def _flash_attention_forward(self, queries, keys, values, cache, scale, mask):
+        B, _, qL, _ = queries.shape # 1, 32, 2048, 128
+        _, _, kL, _ = keys.shape
+        
+        indices_q = mx.arange(0, qL)
+        cu_seqlens_q = mx.array([0, qL], dtype=mx.int32)
+        max_seqlen_in_batch_q = qL
+
+        indices_k = mx.arange(0, kL)
+        cu_seqlens_k = mx.array([0, kL], dtype=mx.int32)
+        max_seqlen_in_batch_k = kL
+
+        attn_output = self.sparse_forward(
+            queries,
+            keys,
+            values,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_in_batch_q,
+            max_seqlen_in_batch_k,
+            cache,
+            mask
+        )
+
+        return attn_output
+
+    def sparse_forward(self, queries, keys, values, cu_seqlens_q, cu_seqlens_k, max_seqlen_in_batch_q, max_seqlen_in_batch_k, cache, mask):
+        compressed_keys, compressed_cu_seqlens = self.compress_k(keys, cu_seqlens_k)
+        # filtered_k = mx.gather(keys, compressed_keys, axis=2)
+        exit(0)
 
 
 class DecoderLayer(nn.Module):
@@ -264,7 +300,7 @@ class MiniCPM4Model(nn.Module):
         for layer, c in zip(self.layers, cache): # 0, 1, ..., 31
             h = layer(h, mask, c)
 
-        return self.norm(h)
+        return self.norm(h) # (1, 2048, 4096)
 
 
 class Model(nn.Module):
@@ -286,7 +322,7 @@ class Model(nn.Module):
         out = self.model(inputs, mask, cache)
 
         if not self.args.tie_word_embeddings: # here
-            out = self.lm_head(out / (self.args.hidden_size / self.args.dim_model_base))
+            out = self.lm_head(out / (self.args.hidden_size / self.args.dim_model_base)) # 4096 / 256 = 16
         else:
             out = out @ self.model.embed_tokens.weight.T
 

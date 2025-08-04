@@ -374,7 +374,7 @@ def generate_step(
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
             )
-        else:
+        else: # here
             return model(input_tokens, cache=prompt_cache)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
@@ -423,7 +423,7 @@ def generate_step(
             mx.eval([c.state for c in prompt_cache])
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt_processed_tokens += prefill_step_size
-            prompt = prompt[prefill_step_size:]
+            prompt = prompt[prefill_step_size:] # 12001 - 2048 = 9953
             input_embeddings = (
                 input_embeddings[prefill_step_size:]
                 if input_embeddings is not None
@@ -665,7 +665,7 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
-    if draft_model is None:
+    if draft_model is None: # here
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
