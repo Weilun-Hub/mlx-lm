@@ -31,6 +31,8 @@ def make_prompt_cache(
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
         ]
+    elif model.args.model_type == "minicpm4":
+        return [MiniCPM4KVCache() for _ in range(num_layers)]
     else: # here
         return [KVCache() for _ in range(num_layers)] # 32
 
@@ -309,6 +311,119 @@ class KVCache(_BaseCache):
             )
         return quant_cache
 
+class MiniCPM4KVCache(_BaseCache):
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self.step = 256
+        
+        self.offset_compressed_keys = 0
+        self.compressed_keys = None
+        self.offset_no_compressed_keys = 0
+        self.no_compressed_keys = None
+        self.cached_compressed_cu_seqlens = []
+
+    def update_and_fetch(self, keys, values):
+        prev = self.offset
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape # [1], [2], 6, [128]
+            v_head_dim = values.shape[3] # 1, 2, 6, [128]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step # 256 as a step, CEIL_DIV
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 256, 128
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim) # 1, 2, 256, 128
+            new_k = mx.zeros(k_shape, keys.dtype) # 1, 2, 256, 128
+            new_v = mx.zeros(v_shape, values.dtype) # 1, 2, 256, 128
+            if self.keys is not None: # skip
+                if prev % self.step != 0: # skip
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2) # 1, 2, [2048 + 2048] = 4096, 128
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else: # here
+                self.keys, self.values = new_k, new_v
+
+        self.offset += keys.shape[2] # 1, 2, [6], 128
+        self.keys[..., prev : self.offset, :] = keys # 1, 2, 0 : 6, 128
+        self.values[..., prev : self.offset, :] = values # 1, 2, 0 : 6, 128
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :] # first self.offset tokens
+
+
+    def update_compressed_keys(self, compressed_keys):
+        prev_compressed_keys = self.offset_compressed_keys
+        if self.compressed_keys is None or (prev_compressed_keys + compressed_keys.shape[2]) > self.compressed_keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = compressed_keys.shape # [1], [2], 511, [128]
+            n_steps = (self.step + compressed_keys.shape[2] - 1) // self.step # 256 as a step, CEIL_DIV
+            compressed_k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 256, 128
+            new_compressed_k = mx.zeros(compressed_k_shape, compressed_keys.dtype) # 1, 2, 256, 128
+            if self.compressed_keys is not None: # skip
+                if prev_compressed_keys % self.step != 0: # skip
+                    self.compressed_keys = self.compressed_keys[..., :prev_compressed_keys, :]
+                self.compressed_keys = mx.concatenate([self.compressed_keys, new_compressed_k], axis=2) # 1, 2, [2048 + 2048] = 4096, 128
+            else: # here
+                self.compressed_keys = new_compressed_k
+
+        self.offset_compressed_keys += compressed_keys.shape[2] # 1, 2, [512], 128
+        self.compressed_keys[..., prev_compressed_keys : self.offset_compressed_keys, :] = compressed_keys # 1, 2, 0 : 6, 128
+        return self.compressed_keys[..., : self.offset_compressed_keys, :] # first self.offset_compressed_keys tokens
+
+    def update_no_compressed_keys(self, no_compressed_keys, kernel_size = 32, kernel_stride = 16):
+        prev_no_compressed_keys = self.offset_no_compressed_keys
+        if self.no_compressed_keys is None or (prev_no_compressed_keys + no_compressed_keys.shape[2]) > self.no_compressed_keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = no_compressed_keys.shape # [1], [2], 16, [128]
+            n_steps = (self.step + no_compressed_keys.shape[2] - 1) // self.step # 256 as a step, CEIL_DIV, 1
+            no_compressed_k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 256, 128
+            new_no_compressed_k = mx.zeros(no_compressed_k_shape, no_compressed_keys.dtype) # 1, 2, 256, 128
+            if self.no_compressed_keys is not None: # skip
+                if prev_no_compressed_keys % self.step != 0: # skip
+                    self.no_compressed_keys = self.no_compressed_keys[..., :prev_no_compressed_keys, :]
+                self.no_compressed_keys = mx.concatenate([self.no_compressed_keys, new_no_compressed_k], axis=2) # 1, 2, [2048 + 2048] = 4096, 128
+            else: # here
+                self.no_compressed_keys = new_no_compressed_k
+
+        self.offset_no_compressed_keys += no_compressed_keys.shape[2] # 1, 2, [16], 128
+        self.no_compressed_keys[..., prev_no_compressed_keys : self.offset_no_compressed_keys, :] = no_compressed_keys # 1, 2, 0 : 6, 128
+
+        current_len = self.no_compressed_keys.shape[2]
+        if current_len >= kernel_size:
+            k_chunk = self.no_compressed_keys[..., :kernel_size, :]
+            self.no_compressed_keys = self.no_compressed_keys[..., kernel_stride:, :]
+            return k_chunk
+        else:
+            return None
+
+    @property
+    def state(self):
+        if self.offset == self.keys.shape[2]:
+            return self.keys, self.values
+        else:
+            return (
+                self.keys[..., : self.offset, :],
+                self.values[..., : self.offset, :],
+            )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self.offset = self.keys.shape[2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+        quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
+        quant_cache.offset = self.offset
+        if self.keys is not None:
+            quant_cache.keys = mx.quantize(self.keys, group_size=group_size, bits=bits)
+            quant_cache.values = mx.quantize(
+                self.values, group_size=group_size, bits=bits
+            )
+        return quant_cache
 
 class RotatingKVCache(_BaseCache):
 

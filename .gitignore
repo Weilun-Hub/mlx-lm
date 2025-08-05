@@ -9,6 +9,8 @@ __pycache__/
 # Vim
 *.swp
 
+tests/data/
+
 # Distribution / packaging
 .Python
 build/

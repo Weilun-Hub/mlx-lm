@@ -88,7 +88,6 @@ def calc_chunks_with_stride(cu_seqlen, chunk_size, kernel_stride):
     del num_filtered_chunks_per_batch, chunk_start_offsets, seq_starts, chunk_end_in_seq, valid_chunk_mask, valid_chunk_mask_npy, chunk_indices
     return filtered_indices, cu_seqlens_compressed # (511 * 32), [0, 511]
 
-
 class CompressK(nn.Module):
     def __init__(self, head_num_k, head_dim, kernel_size, kernel_stride=16):
         """
@@ -114,11 +113,70 @@ class CompressK(nn.Module):
         filtered_k_indices, cu_seqlens_compressed = calc_chunks_with_stride(
             cu_seqlens, self.kernel_size, self.kernel_stride
         ) # (511 * 32), [0, 511]
-        exit(0)
-        filtered_k = mx.gather(k, filtered_k_indices, axis=2)
-        filtered_k = filtered_k.view(filtered_k.shape[0] // self.kernel_size, self.kernel_size, self.head_num_k, self.head_dim)  # [l, block_size,h,d]
-        compressed_k = filtered_k.mean(dim=1)
+        B, H, L, D = k.shape # 1, 2, 8192, 128
+        k_ = mx.transpose(k, (2, 0, 1, 3)) # 8192, 1, 2, 128
+        filtered_k_ = mx.gather(k_, filtered_k_indices, axis=0, slice_sizes=(1, B, H, D)) # 16352, 1, 1, 2, 128
+        filtered_k_ = mx.squeeze(filtered_k_, axis=1) # 16352, 1, 2, 128
+        filtered_k = mx.transpose(filtered_k_, (1, 2, 0, 3)) # 1, 2, 16352, 128
+        filtered_k = filtered_k.reshape(B, H, filtered_k.shape[2] // self.kernel_size, self.kernel_size, D) # 1, 2, 511, 32, 128
+        compressed_k = filtered_k.mean(axis=3) # 1, 2, 511, 128
         return compressed_k, cu_seqlens_compressed
+
+def compressed_attention(
+    queries,
+    compressed_keys,
+    compressed_values,
+    cache,
+    kernel_size,
+    kernel_stride,
+    block_size,
+    topk,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    init_blocks,
+    local_blocks,
+    total_seq_lens
+):
+    batch_size = cu_seqlens_q.shape[0] - 1 # 2 - 1 = 1
+
+    cache_len = total_seq_lens - max_seqlen_q
+    assert batch_size == 1, "Batch size must be 1 for current implementation, but got {}".format(batch_size)
+    # q_idx = mx.array([total_seq_lens - 1], dtype=mx.int32) // block_size
+    
+    _, _, qL, D = queries.shape # 1, 32, 2048, 128
+    
+    scale = 1. / float(mx.sqrt(D))
+    mask = None if qL == 1 else "causal"
+
+    score = mx.fast.infllmv2_attention_stage1(
+        mx.contiguous(queries), # 1, 32, 2048, 128
+        mx.contiguous(compressed_keys), # 1, 2, 511, 128
+        mx.contiguous(compressed_values), # 1, 2, 511, 128
+        scale=scale, # 1 / sqrt(128)
+        mask=mask # "causal"
+    )
+    
+    stride = block_size // kernel_stride
+    kernel_size = stride + 1
+    padding = 1
+    cache_len = cache.offset - qL
+    pooled_score = mx.maxpooling(
+        score, # (1, 2, 2048, 511)
+        cache_len, # 8192 - 2048 = 6144
+        init_blocks, # 1
+        local_blocks, # 32
+        kernel_size, # 5
+        stride, # 4
+        padding, # 1
+        block_size # 64
+    ) # (1, 2, 2048, 128)
+
+    topk = min(topk, pooled_score.shape[3])
+    topk_idx = mx.argtopk(pooled_score, topk, axis=-1) # (1, 2, 2048, 64)
+    
+    return topk_idx
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -200,11 +258,11 @@ class Attention(nn.Module):
             attn_output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             ) # queries: (1, 32, 2048, 128), keys: (1, 2, 4096, 128), values: (1, 2, 4096, 128)
-        elif cache.keys is None or L != 1: # prefill
+        elif cache is None or L != 1: # prefill
             # queries: (1, 32, 2048, 128), keys/values: (1, 2, 8192, 128)
             attn_output = self._flash_attention_forward(queries, keys, values, cache, self.scale, mask)
         else:
-            pass
+            raise NotImplementedError("Not implemented for decoding")
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
@@ -232,15 +290,75 @@ class Attention(nn.Module):
             max_seqlen_in_batch_k,
             cache,
             mask
-        )
+        ) # (1, 32, 2048, 128)
 
         return attn_output
 
     def sparse_forward(self, queries, keys, values, cu_seqlens_q, cu_seqlens_k, max_seqlen_in_batch_q, max_seqlen_in_batch_k, cache, mask):
-        compressed_keys, compressed_cu_seqlens = self.compress_k(keys, cu_seqlens_k)
-        # filtered_k = mx.gather(keys, compressed_keys, axis=2)
-        exit(0)
+        compressed_keys, compressed_cu_seqlens = self.compress_k(keys, cu_seqlens_k) # (1, 2, 511, 128), [0, 511]
+        compressed_values = compressed_keys
+        
+        assert cache is not None, "Cache must be provided for compressed attention"
 
+        no_compressed_k_start = compressed_keys.shape[2] * self.kernel_stride # 511 * 16 = 8176
+        cache.update_compressed_keys(compressed_keys)
+        cache.update_no_compressed_keys(keys[:, :, no_compressed_k_start:, :], no_compressed_k_start)
+        cache.cached_compressed_cu_seqlens.append(compressed_cu_seqlens)
+        
+        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1] # [511]
+
+        topk_idx = compressed_attention(
+            queries,
+            compressed_keys,
+            compressed_values,
+            cache,
+            self.kernel_size, # 32
+            self.kernel_stride, # 16
+            self.block_size, # 64
+            self.topk, # 64
+            cu_seqlens_q, # [0, 2048]
+            compressed_cu_seqlens, # [0, 511]
+            max_seqlen_in_batch_q, # 2048
+            compressed_seqlens.max().item(), # 511
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            total_seq_lens=cache.offset
+        ) # (1, 2, 2048, 64)
+
+        blockmask_uint64 = mx.topk_to_uint64(
+            topk_idx, # (1, 2, 2048, 64)
+            cache.offset, # 8192
+            self.block_size # 64
+        ) # (1, 2, 2048, 2)
+
+        _, _, qL, D = queries.shape # 1, 32, 2048, 128
+        _, _, kL, _ = keys.shape # 1, 2, 8192, 128
+        scale = 1. / float(np.sqrt(D))
+        cu_seqlens_q = mx.array([0, qL], dtype=mx.int32)
+        cu_seqlens_k = mx.array([0, kL], dtype=mx.int32)
+        max_seqlen_q = qL
+        max_seqlen_k = kL
+        window_size_left = -1
+        window_size_right = -1
+        block_window_size = self.window_size // self.block_size # 2048 // 64 = 32
+
+        topk_attn_output = mx.fast.infllmv2_attention_stage2(
+            queries, 
+            keys, 
+            values, 
+            cu_seqlens_q, 
+            cu_seqlens_k, 
+            max_seqlen_q, 
+            max_seqlen_k, 
+            window_size_left, 
+            window_size_right, 
+            blockmask_uint64, 
+            block_window_size, 
+            scale=scale, 
+            mask="causal"
+        ) # (1, 32, 2048, 128)
+
+        return topk_attn_output
 
 class DecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs):

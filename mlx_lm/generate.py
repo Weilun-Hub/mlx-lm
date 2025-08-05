@@ -408,7 +408,7 @@ def generate_step(
     with mx.stream(generation_stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
-        ) # 6, number of tokens in prompt
+        ) # 14001, number of tokens in prompt
         prompt_processed_tokens = 0
         while total_prompt_tokens - prompt_processed_tokens > prefill_step_size: # prefill_step_size = 2048. (6 - 0 > 2048) -> False
             _model_call(
