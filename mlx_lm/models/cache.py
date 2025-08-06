@@ -320,9 +320,8 @@ class MiniCPM4KVCache(_BaseCache):
         
         self.offset_compressed_keys = 0
         self.compressed_keys = None
-        self.offset_no_compressed_keys = 0
         self.no_compressed_keys = None
-        self.cached_compressed_cu_seqlens = []
+        self.cached_compressed_cu_seqlens = None
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
@@ -353,41 +352,32 @@ class MiniCPM4KVCache(_BaseCache):
         prev_compressed_keys = self.offset_compressed_keys
         if self.compressed_keys is None or (prev_compressed_keys + compressed_keys.shape[2]) > self.compressed_keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = compressed_keys.shape # [1], [2], 511, [128]
-            n_steps = (self.step + compressed_keys.shape[2] - 1) // self.step # 256 as a step, CEIL_DIV
-            compressed_k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 256, 128
-            new_compressed_k = mx.zeros(compressed_k_shape, compressed_keys.dtype) # 1, 2, 256, 128
+            n_steps = (self.step + compressed_keys.shape[2] - 1) // self.step # 256 as a step, CEIL_DIV (511 + 256 - 1) // 256 = 2
+            compressed_keys_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 512, 128
+            new_compressed_keys = mx.zeros(compressed_keys_shape, compressed_keys.dtype) # 1, 2, 512, 128
             if self.compressed_keys is not None: # skip
                 if prev_compressed_keys % self.step != 0: # skip
                     self.compressed_keys = self.compressed_keys[..., :prev_compressed_keys, :]
-                self.compressed_keys = mx.concatenate([self.compressed_keys, new_compressed_k], axis=2) # 1, 2, [2048 + 2048] = 4096, 128
+                self.compressed_keys = mx.concatenate([self.compressed_keys, new_compressed_keys], axis=2) # 1, 2, [2048 + 2048] = 4096, 128
             else: # here
-                self.compressed_keys = new_compressed_k
+                self.compressed_keys = new_compressed_keys
 
-        self.offset_compressed_keys += compressed_keys.shape[2] # 1, 2, [512], 128
+        self.offset_compressed_keys += compressed_keys.shape[2] # 1, 2, [511], 128
         self.compressed_keys[..., prev_compressed_keys : self.offset_compressed_keys, :] = compressed_keys # 1, 2, 0 : 6, 128
         return self.compressed_keys[..., : self.offset_compressed_keys, :] # first self.offset_compressed_keys tokens
 
     def update_no_compressed_keys(self, no_compressed_keys, kernel_size = 32, kernel_stride = 16):
-        prev_no_compressed_keys = self.offset_no_compressed_keys
-        if self.no_compressed_keys is None or (prev_no_compressed_keys + no_compressed_keys.shape[2]) > self.no_compressed_keys.shape[2]:
-            B, n_kv_heads, _, k_head_dim = no_compressed_keys.shape # [1], [2], 16, [128]
-            n_steps = (self.step + no_compressed_keys.shape[2] - 1) // self.step # 256 as a step, CEIL_DIV, 1
-            no_compressed_k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim) # 1, 2, 256, 128
-            new_no_compressed_k = mx.zeros(no_compressed_k_shape, no_compressed_keys.dtype) # 1, 2, 256, 128
-            if self.no_compressed_keys is not None: # skip
-                if prev_no_compressed_keys % self.step != 0: # skip
-                    self.no_compressed_keys = self.no_compressed_keys[..., :prev_no_compressed_keys, :]
-                self.no_compressed_keys = mx.concatenate([self.no_compressed_keys, new_no_compressed_k], axis=2) # 1, 2, [2048 + 2048] = 4096, 128
-            else: # here
-                self.no_compressed_keys = new_no_compressed_k
 
-        self.offset_no_compressed_keys += no_compressed_keys.shape[2] # 1, 2, [16], 128
-        self.no_compressed_keys[..., prev_no_compressed_keys : self.offset_no_compressed_keys, :] = no_compressed_keys # 1, 2, 0 : 6, 128
+        if self.no_compressed_keys is None:
+            self.no_compressed_keys = no_compressed_keys
+        else:
+            self.no_compressed_keys = mx.concatenate([self.no_compressed_keys, no_compressed_keys], axis=2)
 
-        if self.offset_no_compressed_keys >= kernel_size:
-            k_chunk = self.no_compressed_keys[..., :kernel_size, :]
-            self.no_compressed_keys = self.no_compressed_keys[..., kernel_stride:, :]
-            self.offset_no_compressed_keys -= kernel_stride
+        current_len = self.no_compressed_keys.shape[2]
+
+        if current_len >= kernel_size:
+            k_chunk = self.no_compressed_keys[:, :, :kernel_size, :]
+            self.no_compressed_keys = self.no_compressed_keys[:, :, kernel_stride:, :]
             return k_chunk
         else:
             return None

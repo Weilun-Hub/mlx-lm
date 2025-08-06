@@ -259,48 +259,50 @@ class Attention(nn.Module):
             ) # queries: (1, 32, 2048, 128), keys: (1, 2, 4096, 128), values: (1, 2, 4096, 128)
         else:
             # queries: (1, 32, 2048, 128), keys/values: (1, 2, 8192, 128)
-            attn_output = self.sparse_forward(queries, keys, values, cache, self.scale, mask)
+            attn_output = self.infllmv2_attention(queries, keys, values, cache, self.scale, mask)
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(attn_output)
 
-    def sparse_forward(self, queries, keys, values, cache, scale, mask): # cu_seqlens_q, cu_seqlens_k, max_seqlen_in_batch_q, max_seqlen_in_batch_k,
+    def infllmv2_attention(self, queries, keys, values, cache, scale, mask): # cu_seqlens_q, cu_seqlens_k, max_seqlen_in_batch_q, max_seqlen_in_batch_k,
         
         _, _, qL, _ = queries.shape
         _, _, kL, _ = keys.shape
 
-        new_keys = keys[:, :, kL - qL:, :]
-
-        if cache.compressed_keys is None:
-            cu_seqlens_k = mx.array([0, kL], dtype=mx.int32)
-            compressed_keys, compressed_cu_seqlens = self.compress_k(keys, cu_seqlens_k)
+        if cache.compressed_keys is None: # init
+            cu_seqlens_k_ = mx.array([0, kL], dtype=mx.int32) # [0, 8192]
+            compressed_keys, compressed_cu_seqlens = self.compress_k(keys, cu_seqlens_k_) # (1, 2, 511, 128), [0, 511]
             
             no_compressed_k_start = compressed_keys.shape[2] * self.kernel_stride # 511 * 16 = 8176
             cache.update_compressed_keys(compressed_keys)
             cache.update_no_compressed_keys(keys[:, :, no_compressed_k_start:, :], no_compressed_k_start)
-            cache.cached_compressed_cu_seqlens.append(compressed_cu_seqlens)
+            cache.cached_compressed_cu_seqlens = compressed_cu_seqlens
         else:
             if qL > 1:
-                no_compressed_k = cache.update_no_compressed_keys(new_keys, kernel_size=new_keys.shape[2], kernel_stride=new_keys.shape[2])
+                no_compressed_k_start = cache.cached_compressed_cu_seqlens[-1] * self.kernel_stride
+                no_compressed_k = keys[:, :, no_compressed_k_start.item(): ]
             else:
+                new_keys = keys[:, :, kL - qL:, :]
                 no_compressed_k = cache.update_no_compressed_keys(new_keys, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
             
             if no_compressed_k is not None:
                 if qL > 1:
-                    cu_seqlens_k = mx.array([0, no_compressed_k.shape[2]], dtype=mx.int32)
-                    compressed_keys, compressed_cu_seqlens = self.compress_k(no_compressed_k, cu_seqlens_k)
+                    cu_seqlens_k_ = mx.array([0, no_compressed_k.shape[2]], dtype=mx.int32)
+                    compressed_keys, compressed_cu_seqlens = self.compress_k(no_compressed_k, cu_seqlens_k_)
                     compressed_keys = cache.update_compressed_keys(compressed_keys)
-                    cache.cached_compressed_cu_seqlens[0][-1] += compressed_cu_seqlens[1] - compressed_cu_seqlens[0]
-                    compressed_cu_seqlens = cache.cached_compressed_cu_seqlens[0]
+                    cache.cached_compressed_cu_seqlens[-1] += compressed_cu_seqlens[1] - compressed_cu_seqlens[0]
+                    no_compressed_k_start = cache.cached_compressed_cu_seqlens[-1] * self.kernel_stride
+                    cache.no_compressed_keys = keys[:, :, no_compressed_k_start.item(): ]
+                    compressed_cu_seqlens = cache.cached_compressed_cu_seqlens
                 else:
-                    compressed_keys = no_compressed_k.mean(axis=3, keepdims=True)
+                    compressed_keys = no_compressed_k.mean(axis=2, keepdims=True)
                     compressed_keys = cache.update_compressed_keys(compressed_keys)
-                    cache.cached_compressed_cu_seqlens[0][-1] += 1
-                    compressed_cu_seqlens = cache.cached_compressed_cu_seqlens[0]
+                    cache.cached_compressed_cu_seqlens[-1] += 1
+                    compressed_cu_seqlens = cache.cached_compressed_cu_seqlens
             else:
-                compressed_keys = cache.compressed_keys
-                compressed_cu_seqlens = cache.cached_compressed_cu_seqlens[0]
+                compressed_keys = cache.compressed_keys[:, :, :cache.offset_compressed_keys, :]
+                compressed_cu_seqlens = cache.cached_compressed_cu_seqlens
         
         compressed_values = compressed_keys
 
