@@ -384,10 +384,10 @@ class MiniCPM4KVCache(_BaseCache):
         self.offset_no_compressed_keys += no_compressed_keys.shape[2] # 1, 2, [16], 128
         self.no_compressed_keys[..., prev_no_compressed_keys : self.offset_no_compressed_keys, :] = no_compressed_keys # 1, 2, 0 : 6, 128
 
-        current_len = self.no_compressed_keys.shape[2]
-        if current_len >= kernel_size:
+        if self.offset_no_compressed_keys >= kernel_size:
             k_chunk = self.no_compressed_keys[..., :kernel_size, :]
             self.no_compressed_keys = self.no_compressed_keys[..., kernel_stride:, :]
+            self.offset_no_compressed_keys -= kernel_stride
             return k_chunk
         else:
             return None

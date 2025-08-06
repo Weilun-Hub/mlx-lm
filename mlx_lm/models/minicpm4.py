@@ -137,7 +137,8 @@ def compressed_attention(
     max_seqlen_k,
     init_blocks,
     local_blocks,
-    total_seq_lens
+    total_seq_lens,
+    scale
 ):
     batch_size = cu_seqlens_q.shape[0] - 1 # 2 - 1 = 1
 
@@ -147,7 +148,7 @@ def compressed_attention(
     
     _, _, qL, D = queries.shape # 1, 32, 2048, 128
     
-    scale = 1. / float(mx.sqrt(D))
+    # scale = 1. / float(mx.sqrt(D))
     mask = None if qL == 1 else "causal"
 
     score = mx.fast.infllmv2_attention_stage1(
@@ -246,64 +247,67 @@ class Attention(nn.Module):
             0, 2, 1, 3
         ) # 1, 6, 256 -> 1, 6, 2, 128 -> 1, 2, 6, 128
 
-        if cache is not None: # here
-            queries = self.rope(queries, offset=cache.offset) # 1, 32, 6, 128 -> 1, 32, 6, 129
-            keys = self.rope(keys, offset=cache.offset) # 1, 2, 6, 128 -> 1, 2, 6, 128
-            keys, values = cache.update_and_fetch(keys, values) # keys / values: 1, 2, 6, 128 -> 1, 2, 6, 128
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+        assert cache is not None, "Cache must be provided for compressed attention"
+
+        queries = self.rope(queries, offset=cache.offset) # 1, 32, 6, 128 -> 1, 32, 6, 129
+        keys = self.rope(keys, offset=cache.offset) # 1, 2, 6, 128 -> 1, 2, 6, 128
+        keys, values = cache.update_and_fetch(keys, values) # keys / values: 1, 2, 6, 128 -> 1, 2, 6, 128
         
         if cache.offset < self.dense_len:
             attn_output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             ) # queries: (1, 32, 2048, 128), keys: (1, 2, 4096, 128), values: (1, 2, 4096, 128)
-        elif cache is None or L != 1: # prefill
-            # queries: (1, 32, 2048, 128), keys/values: (1, 2, 8192, 128)
-            attn_output = self._flash_attention_forward(queries, keys, values, cache, self.scale, mask)
         else:
-            raise NotImplementedError("Not implemented for decoding")
+            # queries: (1, 32, 2048, 128), keys/values: (1, 2, 8192, 128)
+            attn_output = self.sparse_forward(queries, keys, values, cache, self.scale, mask)
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(attn_output)
 
-    def _flash_attention_forward(self, queries, keys, values, cache, scale, mask):
-        B, _, qL, _ = queries.shape # 1, 32, 2048, 128
+    def sparse_forward(self, queries, keys, values, cache, scale, mask): # cu_seqlens_q, cu_seqlens_k, max_seqlen_in_batch_q, max_seqlen_in_batch_k,
+        
+        _, _, qL, _ = queries.shape
         _, _, kL, _ = keys.shape
+
+        new_keys = keys[:, :, kL - qL:, :]
+
+        if cache.compressed_keys is None:
+            cu_seqlens_k = mx.array([0, kL], dtype=mx.int32)
+            compressed_keys, compressed_cu_seqlens = self.compress_k(keys, cu_seqlens_k)
+            
+            no_compressed_k_start = compressed_keys.shape[2] * self.kernel_stride # 511 * 16 = 8176
+            cache.update_compressed_keys(compressed_keys)
+            cache.update_no_compressed_keys(keys[:, :, no_compressed_k_start:, :], no_compressed_k_start)
+            cache.cached_compressed_cu_seqlens.append(compressed_cu_seqlens)
+        else:
+            if qL > 1:
+                no_compressed_k = cache.update_no_compressed_keys(new_keys, kernel_size=new_keys.shape[2], kernel_stride=new_keys.shape[2])
+            else:
+                no_compressed_k = cache.update_no_compressed_keys(new_keys, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
+            
+            if no_compressed_k is not None:
+                if qL > 1:
+                    cu_seqlens_k = mx.array([0, no_compressed_k.shape[2]], dtype=mx.int32)
+                    compressed_keys, compressed_cu_seqlens = self.compress_k(no_compressed_k, cu_seqlens_k)
+                    compressed_keys = cache.update_compressed_keys(compressed_keys)
+                    cache.cached_compressed_cu_seqlens[0][-1] += compressed_cu_seqlens[1] - compressed_cu_seqlens[0]
+                    compressed_cu_seqlens = cache.cached_compressed_cu_seqlens[0]
+                else:
+                    compressed_keys = no_compressed_k.mean(axis=3, keepdims=True)
+                    compressed_keys = cache.update_compressed_keys(compressed_keys)
+                    cache.cached_compressed_cu_seqlens[0][-1] += 1
+                    compressed_cu_seqlens = cache.cached_compressed_cu_seqlens[0]
+            else:
+                compressed_keys = cache.compressed_keys
+                compressed_cu_seqlens = cache.cached_compressed_cu_seqlens[0]
         
-        indices_q = mx.arange(0, qL)
-        cu_seqlens_q = mx.array([0, qL], dtype=mx.int32)
-        max_seqlen_in_batch_q = qL
-
-        indices_k = mx.arange(0, kL)
-        cu_seqlens_k = mx.array([0, kL], dtype=mx.int32)
-        max_seqlen_in_batch_k = kL
-
-        attn_output = self.sparse_forward(
-            queries,
-            keys,
-            values,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_in_batch_q,
-            max_seqlen_in_batch_k,
-            cache,
-            mask
-        ) # (1, 32, 2048, 128)
-
-        return attn_output
-
-    def sparse_forward(self, queries, keys, values, cu_seqlens_q, cu_seqlens_k, max_seqlen_in_batch_q, max_seqlen_in_batch_k, cache, mask):
-        compressed_keys, compressed_cu_seqlens = self.compress_k(keys, cu_seqlens_k) # (1, 2, 511, 128), [0, 511]
         compressed_values = compressed_keys
-        
-        assert cache is not None, "Cache must be provided for compressed attention"
 
-        no_compressed_k_start = compressed_keys.shape[2] * self.kernel_stride # 511 * 16 = 8176
-        cache.update_compressed_keys(compressed_keys)
-        cache.update_no_compressed_keys(keys[:, :, no_compressed_k_start:, :], no_compressed_k_start)
-        cache.cached_compressed_cu_seqlens.append(compressed_cu_seqlens)
+        cu_seqlens_q = mx.array([0, qL], dtype=mx.int32)
+        cu_seqlens_k = mx.array([0, kL], dtype=mx.int32)
+        max_seqlen_q = qL
+        max_seqlen_k = kL
         
         compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1] # [511]
 
@@ -318,11 +322,12 @@ class Attention(nn.Module):
             self.topk, # 64
             cu_seqlens_q, # [0, 2048]
             compressed_cu_seqlens, # [0, 511]
-            max_seqlen_in_batch_q, # 2048
+            max_seqlen_q, # 2048
             compressed_seqlens.max().item(), # 511
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
-            total_seq_lens=cache.offset
+            total_seq_lens=cache.offset,
+            scale=scale
         ) # (1, 2, 2048, 64)
 
         blockmask_uint64 = mx.topk_to_uint64(
@@ -330,14 +335,8 @@ class Attention(nn.Module):
             cache.offset, # 8192
             self.block_size # 64
         ) # (1, 2, 2048, 2)
+        mx.eval(blockmask_uint64)
 
-        _, _, qL, D = queries.shape # 1, 32, 2048, 128
-        _, _, kL, _ = keys.shape # 1, 2, 8192, 128
-        scale = 1. / float(np.sqrt(D))
-        cu_seqlens_q = mx.array([0, qL], dtype=mx.int32)
-        cu_seqlens_k = mx.array([0, kL], dtype=mx.int32)
-        max_seqlen_q = qL
-        max_seqlen_k = kL
         window_size_left = -1
         window_size_right = -1
         block_window_size = self.window_size // self.block_size # 2048 // 64 = 32
@@ -347,7 +346,7 @@ class Attention(nn.Module):
             keys, 
             values, 
             cu_seqlens_q, 
-            cu_seqlens_k, 
+            cu_seqlens_k,
             max_seqlen_q, 
             max_seqlen_k, 
             window_size_left, 
@@ -355,8 +354,11 @@ class Attention(nn.Module):
             blockmask_uint64, 
             block_window_size, 
             scale=scale, 
-            mask="causal"
+            mask=mask
         ) # (1, 32, 2048, 128)
+
+        mx.eval(topk_attn_output)
+        # mx.clear_cache()
 
         return topk_attn_output
 
