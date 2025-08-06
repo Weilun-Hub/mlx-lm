@@ -409,6 +409,8 @@ def generate_step(
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         ) # 14001, number of tokens in prompt
+        print("[DEBUG ZWL] total prompt tokens:", total_prompt_tokens)
+        #exit()
         prompt_processed_tokens = 0
         while total_prompt_tokens - prompt_processed_tokens > prefill_step_size: # prefill_step_size = 2048. (6 - 0 > 2048) -> False
             _model_call(
@@ -423,7 +425,7 @@ def generate_step(
             mx.eval([c.state for c in prompt_cache])
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt_processed_tokens += prefill_step_size
-            # print(f"prompt_processed_tokens: {prompt_processed_tokens}")
+            print(f"[DEBUG ZWL] prompt_processed_tokens: {prompt_processed_tokens}")
             prompt = prompt[prefill_step_size:] # 14001 - 2048 = 11953
             input_embeddings = (
                 input_embeddings[prefill_step_size:]

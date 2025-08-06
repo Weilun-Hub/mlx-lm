@@ -222,6 +222,7 @@ class Attention(nn.Module):
         self.block_size = self.args.sparse_config.get("block_size", 64) # 64
         self.window_size = self.args.sparse_config.get("window_size", 2048) # 2048
         self.dense_len = self.args.sparse_config.get("dense_len", 8192) # 8192
+        #self.dense_len = 131072
 
         self.local_blocks = self.window_size // self.block_size # 2048 // 64 = 32
         self.topk = self.args.sparse_config.get("topk", 64) # 64
